@@ -49,6 +49,7 @@ module Network.AWS.Auth
     , fromFilePath
     , fromProfile
     , fromProfileName
+    , fromContainer
 
     -- ** Keys
     , AccessKey    (..)
@@ -66,6 +67,7 @@ import           Control.Monad
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Maybe  (MaybeT (..))
+
 import qualified Data.ByteString.Char8      as BS8
 import qualified Data.ByteString.Lazy.Char8 as LBS8
 import           Data.Char                  (isSpace)
@@ -82,10 +84,12 @@ import           Network.AWS.Lens           (catching, catching_, exception,
 import           Network.AWS.Lens           (Prism', prism, (<&>))
 import           Network.AWS.Prelude
 import           Network.AWS.Types
+import qualified Network.HTTP.Conduit       as HTTP
 import           Network.HTTP.Conduit
 import           System.Directory           (doesFileExist, getHomeDirectory)
 import           System.Environment
 import           System.Mem.Weak
+
 
 -- | Default access key environment variable.
 envAccessKey :: Text -- ^ AWS_ACCESS_KEY_ID
@@ -106,6 +110,11 @@ envProfile = "AWS_PROFILE"
 -- | Default region environment variable
 envRegion :: Text -- ^ AWS_REGION
 envRegion = "AWS_REGION"
+
+-- | Path to obtain container credentials environment variable (see
+-- 'FromContainer').
+envContainerCredentialsURI :: Text -- ^ AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+envContainerCredentialsURI = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
 
 -- | Credentials INI file access key variable.
 credAccessKey :: Text -- ^ aws_access_key_id
@@ -177,12 +186,21 @@ data Credentials
       -- ^ A credentials profile name (the INI section) and the path to the AWS
       -- <http://blogs.aws.amazon.com/security/post/Tx3D6U6WSFGOK2H/A-New-and-Standardized-Way-to-Manage-Credentials-in-the-AWS-SDKs credentials> file.
 
+    | FromContainer
+      -- ^ Obtain credentials by attempting to contact the ECS container agent
+      -- at <http://169.254.170.2> using the path in 'envContainerCredentialsURI'.
+      -- See <http://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html IAM Roles for Tasks>
+      -- in the AWS documentation for more information.
+
     | Discover
       -- ^ Attempt credentials discovery via the following steps:
       --
       -- * Read the 'envAccessKey', 'envSecretKey', and 'envRegion' from the environment if they are set.
       --
       -- * Read the credentials file if 'credFile' exists.
+      --
+      -- * Obtain credentials from the ECS container agent if
+      -- 'envContainerCredentialsURI' is set.
       --
       -- * Retrieve the first available IAM profile and read
       -- the 'Region' from the instance identity document, if running on EC2.
@@ -205,6 +223,8 @@ instance ToLog Credentials where
             "FromProfile " <> build n
         FromFile    n f ->
             "FromFile " <> build n <> " " <> build f
+        FromContainer ->
+            "FromContainer"
         Discover ->
             "Discover"
       where
@@ -310,19 +330,22 @@ getAuth m = \case
     FromEnv     a s t r -> fromEnvKeys a s t r
     FromProfile n       -> fromProfileName m n
     FromFile    n f     -> fromFilePath n f
+    FromContainer       -> fromContainer m
     Discover            ->
         -- Don't try and catch InvalidFileError, or InvalidIAMProfile,
         -- let both errors propagate.
         catching_ _MissingEnvError fromEnv $
             -- proceed, missing env keys
-            catching _MissingFileError fromFile $ \f -> do
+            catching _MissingFileError fromFile $ \f ->
                 -- proceed, missing credentials file
-                p <- isEC2 m
-                unless p $
-                    -- not an EC2 instance, rethrow the previous error.
-                    throwingM _MissingFileError f
-                 -- proceed, check EC2 metadata for IAM information.
-                fromProfile m
+                catching_ _MissingEnvError (fromContainer m) $ do
+                  -- proceed, missing env key
+                  p <- isEC2 m
+                  unless p $
+                      -- not an EC2 instance, rethrow the previous error.
+                      throwingM _MissingFileError f
+                   -- proceed, check EC2 metadata for IAM information.
+                  fromProfile m
 
 -- | Retrieve access key, secret key, and a session token from the default
 -- environment variables.
@@ -464,11 +487,11 @@ fromProfileName :: (MonadIO m, MonadCatch m)
                 -> Text
                 -> m (Auth, Maybe Region)
 fromProfileName m name = do
-    auth <- getCredentials >>= start
+    auth <- liftIO $ fetchAuthInBackground getCredentials
     reg  <- getRegion
     return (auth, Just reg)
   where
-    getCredentials :: (MonadIO m, MonadCatch m) => m AuthEnv
+    getCredentials :: IO AuthEnv
     getCredentials =
         try (metadata m (IAM . SecurityCredentials $ Just name)) >>=
             handleErr (eitherDecode' . LBS8.fromStrict) invalidIAMErr
@@ -489,26 +512,59 @@ fromProfileName m name = do
         . mappend "Error parsing Instance Identity Document "
         . Text.pack
 
-    start :: MonadIO m => AuthEnv -> m Auth
-    start !a = liftIO $
-        case _authExpiry a of
-            Nothing -> return (Auth a)
-            Just x  -> do
-                r <- newIORef a
-                p <- myThreadId
-                s <- timer r p x
-                return (Ref s r)
+fromContainer :: (MonadIO m, MonadThrow m)
+              => Manager
+              -> m (Auth, Maybe Region)
+fromContainer m = do
+    req  <- getCredentialsURI
+    auth <- liftIO $ fetchAuthInBackground (renew req)
+    reg  <- getRegion
+    return (auth, reg)
+  where
+    getCredentialsURI :: (MonadIO m, MonadThrow m) => m HTTP.Request
+    getCredentialsURI = do
+        mp <- liftIO (lookupEnv (Text.unpack envContainerCredentialsURI))
+        p  <- maybe (throwM . MissingEnvError $ "Unable to read ENV variable: " <> envContainerCredentialsURI)
+                    return
+                    mp
+        parseUrlThrow $ "http://169.254.170.2" <> p
 
-    timer :: IORef AuthEnv -> ThreadId -> UTCTime -> IO ThreadId
-    timer !r !p !x = forkIO $ do
+    renew :: HTTP.Request -> IO AuthEnv
+    renew req = do
+        rs <- httpLbs req m
+        either (throwM . invalidIdentityErr) return (eitherDecode (responseBody rs))
+
+    invalidIdentityErr = InvalidIAMError
+        . mappend "Error parsing Task Identity Document "
+        . Text.pack
+
+    getRegion :: MonadIO m => m (Maybe Region)
+    getRegion = runMaybeT $ do
+        mr <- MaybeT . liftIO $ lookupEnv (Text.unpack envRegion)
+        either (const . MaybeT $ return Nothing)
+               return
+               (fromText (Text.pack mr))
+
+fetchAuthInBackground :: IO AuthEnv -> IO Auth
+fetchAuthInBackground menv = menv >>= \(!env) -> liftIO $
+    case _authExpiry env of
+        Nothing -> return (Auth env)
+        Just x  -> do
+          r <- newIORef env
+          p <- myThreadId
+          s <- timer menv r p x
+          return (Ref s r)
+  where
+    timer :: IO AuthEnv -> IORef AuthEnv -> ThreadId -> UTCTime -> IO ThreadId
+    timer ma !r !p !x = forkIO $ do
         s <- myThreadId
         w <- mkWeakIORef r (killThread s)
-        loop w p x
+        loop ma w p x
 
-    loop :: Weak (IORef AuthEnv) -> ThreadId -> UTCTime -> IO ()
-    loop w !p !x = do
+    loop :: IO AuthEnv -> Weak (IORef AuthEnv) -> ThreadId -> UTCTime -> IO ()
+    loop ma w !p !x = do
         diff x <$> getCurrentTime >>= threadDelay
-        env <- try getCredentials
+        env <- try ma
         case env of
             Left   e -> throwTo p (RetrievalError e)
             Right !a -> do
@@ -517,7 +573,7 @@ fromProfileName m name = do
                      Nothing -> return ()
                      Just  r -> do
                          atomicWriteIORef r a
-                         maybe (return ()) (loop w p) (_authExpiry a)
+                         maybe (return ()) (loop ma w p) (_authExpiry a)
 
     diff !x !y = (* 1000000) $ if n > 0 then n else 1
       where
